@@ -1,0 +1,239 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Telegram webhook ingress with API Gateway, Lambda and SNS for choreography
+
+Parameters:
+  TelegramSecretToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Optional secret token to validate Telegram webhook header X-Telegram-Bot-Api-Secret-Token
+  TenantId:
+    Type: String
+    Default: default
+    Description: Tenant identifier used to compose idempotency key
+  IdempotencyTtlHours:
+    Type: Number
+    Default: 48
+    Description: TTL in hours for idempotency records
+  OutboxTtlHours:
+    Type: Number
+    Default: 168
+    Description: TTL in hours for outbox records
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Architectures:
+      - x86_64
+    MemorySize: 256
+    Timeout: 10
+    Tracing: Active
+
+Resources:
+  WebhookApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub ${AWS::StackName}-webhook-api
+      StageName: prod
+      TracingEnabled: true
+
+  DomainEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-domain-events
+
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-idempotency
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  OutboxTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-outbox
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  EventLoggerDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-event-logger-dlq
+      MessageRetentionPeriod: 1209600
+
+  EventLoggerQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-event-logger-queue
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EventLoggerDlq.Arn
+        maxReceiveCount: 5
+
+  EventLoggerQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EventLoggerQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSnsSendMessage
+            Effect: Allow
+            Principal: "*"
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventLoggerQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref DomainEventsTopic
+
+  EventLoggerQueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref DomainEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt EventLoggerQueue.Arn
+      RawMessageDelivery: true
+
+  TelegramIngressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-telegram-ingress
+      CodeUri: .
+      Handler: app.handler
+      Description: Receives Telegram webhook updates and writes idempotency+outbox in one DynamoDB transaction
+      Environment:
+        Variables:
+          TELEGRAM_SECRET_TOKEN: !Ref TelegramSecretToken
+          IDEMPOTENCY_TABLE_NAME: !Ref IdempotencyTable
+          OUTBOX_TABLE_NAME: !Ref OutboxTable
+          IDEMPOTENCY_TTL_HOURS: !Ref IdempotencyTtlHours
+          OUTBOX_TTL_HOURS: !Ref OutboxTtlHours
+          TENANT_ID: !Ref TenantId
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IdempotencyTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OutboxTable
+      Events:
+        TelegramWebhook:
+          Type: Api
+          Properties:
+            RestApiId: !Ref WebhookApi
+            Path: /telegram/webhook
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/ingress/app.ts
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+
+  OutboxPublisherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-outbox-publisher
+      CodeUri: .
+      Handler: app.handler
+      Description: Publishes outbox events from DynamoDB Stream to SNS
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref DomainEventsTopic
+          OUTBOX_TABLE_NAME: !Ref OutboxTable
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt DomainEventsTopic.TopicName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OutboxTable
+      Events:
+        OutboxStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt OutboxTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 100
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/outbox_publisher/app.ts
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+
+  EventLoggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-event-logger
+      CodeUri: .
+      Handler: app.handler
+      Description: Example consumer that reacts to normalized events via SQS fan-out
+      Events:
+        DomainEventQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EventLoggerQueue.Arn
+            BatchSize: 10
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/consumer_logger/app.ts
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+
+Outputs:
+  ApiBaseUrl:
+    Description: Base URL of the webhook API
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/prod
+
+  TelegramWebhookUrl:
+    Description: Telegram webhook URL path
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/prod/telegram/webhook
+
+  DomainEventsTopicArn:
+    Description: SNS topic ARN for normalized domain events
+    Value: !Ref DomainEventsTopic
+
+  EventLoggerQueueArn:
+    Description: SQS queue ARN subscribed to domain events topic
+    Value: !GetAtt EventLoggerQueue.Arn
+
+  EventLoggerDlqArn:
+    Description: DLQ ARN for event logger queue
+    Value: !GetAtt EventLoggerDlq.Arn
+
+  IdempotencyTableName:
+    Description: DynamoDB table used for ingress idempotency
+    Value: !Ref IdempotencyTable
+
+  OutboxTableName:
+    Description: DynamoDB table used as transactional outbox
+    Value: !Ref OutboxTable
