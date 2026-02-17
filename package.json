@@ -5,10 +5,12 @@
   "description": "Telegram webhook ingress with AWS SAM, Lambda and SNS choreography",
   "scripts": {
     "build": "sam build",
-    "deploy:guided": "sam deploy --guided"
+    "deploy:guided": "sam deploy --guided",
+    "deploy": "sam deploy"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.883.0",
+    "@aws-sdk/client-ssm": "^3.883.0",
     "@aws-sdk/client-sns": "^3.883.0",
     "@aws-sdk/lib-dynamodb": "^3.883.0"
   },

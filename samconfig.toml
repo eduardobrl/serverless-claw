@@ -1,0 +1,13 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "serverlessclaw"
+resolve_s3 = true
+s3_prefix = "serverlessclaw"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "TelegramBotTokenParameterName=\"/serverlessclaw/telegram/bot-token\" TenantId=\"default\" IdempotencyTtlHours=\"48\" OutboxTtlHours=\"168\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-east-1"

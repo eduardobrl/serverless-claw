@@ -3,11 +3,10 @@ Transform: AWS::Serverless-2016-10-31
 Description: Telegram webhook ingress with API Gateway, Lambda and SNS for choreography
 
 Parameters:
-  TelegramSecretToken:
+  TelegramBotTokenParameterName:
     Type: String
-    Default: ""
-    NoEcho: true
-    Description: Optional secret token to validate Telegram webhook header X-Telegram-Bot-Api-Secret-Token
+    Default: /serverlessclaw/telegram/bot-token
+    Description: Name of an existing SSM SecureString parameter that stores the Telegram bot token
   TenantId:
     Type: String
     Default: default
@@ -128,7 +127,6 @@ Resources:
       Description: Receives Telegram webhook updates and writes idempotency+outbox in one DynamoDB transaction
       Environment:
         Variables:
-          TELEGRAM_SECRET_TOKEN: !Ref TelegramSecretToken
           IDEMPOTENCY_TABLE_NAME: !Ref IdempotencyTable
           OUTBOX_TABLE_NAME: !Ref OutboxTable
           IDEMPOTENCY_TTL_HOURS: !Ref IdempotencyTtlHours
@@ -209,6 +207,82 @@ Resources:
         Target: es2020
         Sourcemap: true
 
+  TelegramResponderDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-telegram-responder-dlq
+      MessageRetentionPeriod: 1209600
+
+  TelegramResponderQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-telegram-responder-queue
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt TelegramResponderDlq.Arn
+        maxReceiveCount: 5
+
+  TelegramResponderQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref TelegramResponderQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSnsSendMessage
+            Effect: Allow
+            Principal: "*"
+            Action: sqs:SendMessage
+            Resource: !GetAtt TelegramResponderQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref DomainEventsTopic
+
+  TelegramResponderQueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref DomainEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt TelegramResponderQueue.Arn
+      RawMessageDelivery: true
+      FilterPolicy:
+        event_type:
+          - message
+
+  TelegramResponderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-telegram-responder
+      CodeUri: .
+      Handler: app.handler
+      Description: Consumes normalized message events from SQS and replies Ola Mundo in Telegram
+      Environment:
+        Variables:
+          TELEGRAM_BOT_TOKEN_PARAMETER_NAME: !Ref TelegramBotTokenParameterName
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: ReadTelegramBotTokenParameter
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramBotTokenParameterName}
+      Events:
+        TelegramResponderQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TelegramResponderQueue.Arn
+            BatchSize: 10
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/telegram_responder/app.ts
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+
 Outputs:
   ApiBaseUrl:
     Description: Base URL of the webhook API
@@ -229,6 +303,18 @@ Outputs:
   EventLoggerDlqArn:
     Description: DLQ ARN for event logger queue
     Value: !GetAtt EventLoggerDlq.Arn
+
+  TelegramResponderQueueArn:
+    Description: SQS queue ARN consumed by Telegram responder lambda
+    Value: !GetAtt TelegramResponderQueue.Arn
+
+  TelegramResponderDlqArn:
+    Description: DLQ ARN for telegram responder queue
+    Value: !GetAtt TelegramResponderDlq.Arn
+
+  TelegramBotTokenParameterName:
+    Description: Existing SSM SecureString parameter name that stores telegram bot token
+    Value: !Ref TelegramBotTokenParameterName
 
   IdempotencyTableName:
     Description: DynamoDB table used for ingress idempotency
