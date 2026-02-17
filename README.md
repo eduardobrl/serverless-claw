@@ -18,6 +18,7 @@ Projeto serverless para AWS com arquitetura coreografada por eventos, usando Typ
 
 - `template.yaml`: infraestrutura AWS SAM.
 - `src/ingress/app.ts`: Lambda de ingressão e gravação transacional (`Idempotency + Outbox`).
+- `src/mcp_server/app.ts`: MCP server HTTP (JSON-RPC) para chamadas de tools que escrevem no outbox.
 - `src/outbox_publisher/app.ts`: publica eventos da outbox no SNS via DynamoDB Stream.
 - `src/consumer_logger/app.ts`: consumidor exemplo lendo eventos via SQS.
 - `src/telegram_responder/app.ts`: consumidor que responde `Ola Mundo` ao Telegram.
@@ -58,6 +59,56 @@ curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
   -d '{
     "url": "<TELEGRAM_WEBHOOK_URL>",
     "secret_token": "<MESMO_TOKEN_DO_DEPLOY>"
+  }'
+```
+
+## MCP server (HTTP)
+
+Após o deploy, use o output `McpServerUrl`.
+
+`initialize`:
+
+```bash
+curl -X POST "<MCP_SERVER_URL>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc":"2.0",
+    "id":1,
+    "method":"initialize",
+    "params":{}
+  }'
+```
+
+`tools/list`:
+
+```bash
+curl -X POST "<MCP_SERVER_URL>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc":"2.0",
+    "id":2,
+    "method":"tools/list",
+    "params":{}
+  }'
+```
+
+`tools/call` (`publish_chat_reply_requested`): cria item no outbox (`status=PENDING`) para publicação assíncrona.
+
+```bash
+curl -X POST "<MCP_SERVER_URL>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc":"2.0",
+    "id":3,
+    "method":"tools/call",
+    "params":{
+      "name":"publish_chat_reply_requested",
+      "arguments":{
+        "source":"telegram",
+        "chat_id":"123456",
+        "text":"hello world"
+      }
+    }
   }'
 ```
 

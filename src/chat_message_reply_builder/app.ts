@@ -1,5 +1,6 @@
 import { SQSBatchResponse, SQSHandler, SQSRecord } from 'aws-lambda';
-import { PublishCommand, SNSClient } from '@aws-sdk/client-sns';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
 
 type DomainEvent = {
   id?: string;
@@ -28,8 +29,10 @@ type ChatMessageReplyRequestedEvent = {
   };
 };
 
-const snsClient = new SNSClient({});
-const topicArn = process.env.SNS_TOPIC_ARN;
+const ddbClient = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+const outboxTableName = process.env.OUTBOX_TABLE_NAME;
+const tenantId = process.env.TENANT_ID || 'default';
+const outboxTtlHours = Number(process.env.OUTBOX_TTL_HOURS || '168');
 
 function logInfo(event: string, data: Record<string, unknown> = {}): void {
   console.info({
@@ -77,28 +80,41 @@ function buildReplyRequestedEvent(chatId: string | number, source: string): Chat
   };
 }
 
-async function publishReplyRequested(event: ChatMessageReplyRequestedEvent): Promise<void> {
-  if (!topicArn) {
-    throw new Error('Missing required env var SNS_TOPIC_ARN');
+async function writeReplyRequestedToOutbox(event: ChatMessageReplyRequestedEvent): Promise<void> {
+  if (!outboxTableName) {
+    throw new Error('Missing required env var OUTBOX_TABLE_NAME');
   }
 
-  await snsClient.send(
-    new PublishCommand({
-      TopicArn: topicArn,
-      Message: JSON.stringify(event),
-      MessageAttributes: {
-        event_type: { DataType: 'String', StringValue: event.type },
-        source: { DataType: 'String', StringValue: event.source },
-        channel: { DataType: 'String', StringValue: event.payload.channel },
-        event_version: { DataType: 'String', StringValue: event.version },
+  const now = new Date();
+  const nowUnix = Math.floor(now.getTime() / 1000);
+  const ttl = nowUnix + Math.max(1, outboxTtlHours) * 3600;
+  const pk = `${tenantId}#${event.source}#chat#${String(event.payload.chat_id)}`;
+
+  await ddbClient.send(
+    new PutCommand({
+      TableName: outboxTableName,
+      Item: {
+        PK: pk,
+        SK: event.id,
+        tenantId,
+        source: event.source,
+        eventType: event.type,
+        eventVersion: event.version,
+        payload: event,
+        createdAt: now.toISOString(),
+        status: 'PENDING',
+        ttl,
       },
+      ConditionExpression: 'attribute_not_exists(PK) AND attribute_not_exists(SK)',
     }),
   );
-  logInfo('reply_requested.published', {
+
+  logInfo('reply_requested.outbox_written', {
     eventId: event.id,
     eventType: event.type,
     channel: event.payload.channel,
     chatId: event.payload.chat_id,
+    outboxPk: pk,
   });
 }
 
@@ -123,7 +139,7 @@ export const handler: SQSHandler = async (event): Promise<SQSBatchResponse> => {
       }
 
       const replyRequested = buildReplyRequestedEvent(chatId, source);
-      await publishReplyRequested(replyRequested);
+      await writeReplyRequestedToOutbox(replyRequested);
       logInfo('record.processing.completed', { messageId: record.messageId, source, chatId });
     } catch (error) {
       logError('record.processing.failed', error, { messageId: record.messageId });

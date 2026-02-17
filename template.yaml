@@ -153,6 +153,37 @@ Resources:
         Target: es2020
         Sourcemap: true
 
+  McpServerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-mcp-server
+      CodeUri: .
+      Handler: app.handler
+      Description: MCP server over HTTP for tool calls that enqueue domain events in outbox
+      Environment:
+        Variables:
+          OUTBOX_TABLE_NAME: !Ref OutboxTable
+          TENANT_ID: !Ref TenantId
+          OUTBOX_TTL_HOURS: !Ref OutboxTtlHours
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OutboxTable
+      Events:
+        McpApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref WebhookApi
+            Path: /mcp
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/mcp_server/app.ts
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+
   OutboxPublisherFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -256,13 +287,15 @@ Resources:
       FunctionName: !Sub ${AWS::StackName}-chat-message-reply-builder
       CodeUri: .
       Handler: app.handler
-      Description: Consumes message events and publishes chat.message.reply.requested preserving source
+      Description: Consumes message events and writes chat.message.reply.requested in outbox preserving source
       Environment:
         Variables:
-          SNS_TOPIC_ARN: !Ref DomainEventsTopic
+          OUTBOX_TABLE_NAME: !Ref OutboxTable
+          TENANT_ID: !Ref TenantId
+          OUTBOX_TTL_HOURS: !Ref OutboxTtlHours
       Policies:
-        - SNSPublishMessagePolicy:
-            TopicName: !GetAtt DomainEventsTopic.TopicName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OutboxTable
       Events:
         ChatMessageReplyBuilderQueueEvent:
           Type: SQS
@@ -364,6 +397,10 @@ Outputs:
   TelegramWebhookUrl:
     Description: Telegram webhook URL path
     Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/prod/telegram/webhook
+
+  McpServerUrl:
+    Description: MCP server HTTP endpoint
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/prod/mcp
 
   DomainEventsTopicArn:
     Description: SNS topic ARN for normalized domain events
