@@ -207,6 +207,77 @@ Resources:
         Target: es2020
         Sourcemap: true
 
+  ChatMessageReplyBuilderDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-chat-message-reply-builder-dlq
+      MessageRetentionPeriod: 1209600
+
+  ChatMessageReplyBuilderQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-chat-message-reply-builder-queue
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ChatMessageReplyBuilderDlq.Arn
+        maxReceiveCount: 5
+
+  ChatMessageReplyBuilderQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ChatMessageReplyBuilderQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSnsSendMessage
+            Effect: Allow
+            Principal: "*"
+            Action: sqs:SendMessage
+            Resource: !GetAtt ChatMessageReplyBuilderQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref DomainEventsTopic
+
+  ChatMessageReplyBuilderQueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref DomainEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt ChatMessageReplyBuilderQueue.Arn
+      RawMessageDelivery: true
+      FilterPolicy:
+        event_type:
+          - message
+
+  ChatMessageReplyBuilderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-chat-message-reply-builder
+      CodeUri: .
+      Handler: app.handler
+      Description: Consumes message events and publishes chat.message.reply.requested preserving source
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref DomainEventsTopic
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt DomainEventsTopic.TopicName
+      Events:
+        ChatMessageReplyBuilderQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ChatMessageReplyBuilderQueue.Arn
+            BatchSize: 10
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/chat_message_reply_builder/app.ts
+        Minify: true
+        Target: es2020
+        Sourcemap: true
+
   TelegramResponderDlq:
     Type: AWS::SQS::Queue
     Properties:
@@ -248,7 +319,9 @@ Resources:
       RawMessageDelivery: true
       FilterPolicy:
         event_type:
-          - message
+          - chat.message.reply.requested
+        source:
+          - telegram
 
   TelegramResponderFunction:
     Type: AWS::Serverless::Function
@@ -256,7 +329,7 @@ Resources:
       FunctionName: !Sub ${AWS::StackName}-telegram-responder
       CodeUri: .
       Handler: app.handler
-      Description: Consumes normalized message events from SQS and replies Ola Mundo in Telegram
+      Description: Consumes chat.message.reply.requested events from telegram source and sends messages to Telegram users
       Environment:
         Variables:
           TELEGRAM_BOT_TOKEN_PARAMETER_NAME: !Ref TelegramBotTokenParameterName
@@ -303,6 +376,14 @@ Outputs:
   EventLoggerDlqArn:
     Description: DLQ ARN for event logger queue
     Value: !GetAtt EventLoggerDlq.Arn
+
+  ChatMessageReplyBuilderQueueArn:
+    Description: SQS queue ARN consumed by chat message reply builder lambda
+    Value: !GetAtt ChatMessageReplyBuilderQueue.Arn
+
+  ChatMessageReplyBuilderDlqArn:
+    Description: DLQ ARN for chat message reply builder queue
+    Value: !GetAtt ChatMessageReplyBuilderDlq.Arn
 
   TelegramResponderQueueArn:
     Description: SQS queue ARN consumed by Telegram responder lambda
