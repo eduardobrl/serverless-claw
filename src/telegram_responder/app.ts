@@ -3,11 +3,8 @@ import { GetParameterCommand, SSMClient } from '@aws-sdk/client-ssm';
 
 type DomainEvent = {
   payload?: {
-    message?: {
-      chat?: {
-        id?: number | string;
-      };
-    };
+    chat_id?: number | string;
+    text?: string;
   };
 };
 
@@ -46,7 +43,7 @@ function parseDomainEvent(record: SQSRecord): DomainEvent {
   return event;
 }
 
-async function sendHelloWorld(chatId: string | number): Promise<void> {
+async function sendTelegramMessage(chatId: string | number, text: string): Promise<void> {
   logInfo('telegram.send_message.started', { chatId });
   const telegramBotToken = await getTelegramBotToken();
 
@@ -57,7 +54,7 @@ async function sendHelloWorld(chatId: string | number): Promise<void> {
     },
     body: JSON.stringify({
       chat_id: chatId,
-      text: 'Ola Mundo',
+      text,
     }),
   });
 
@@ -114,15 +111,20 @@ export const handler: SQSHandler = async (event): Promise<SQSBatchResponse> => {
     try {
       logInfo('record.processing.started', { messageId: record.messageId });
       const domainEvent = parseDomainEvent(record);
-      const chatId = domainEvent.payload?.message?.chat?.id;
+      const chatId = domainEvent.payload?.chat_id;
+      const text = domainEvent.payload?.text;
 
-      if (!chatId) {
-        logInfo('record.processing.skipped_missing_chat_id', { messageId: record.messageId });
+      if (!chatId || !text) {
+        logInfo('record.processing.skipped_missing_payload', {
+          messageId: record.messageId,
+          hasChatId: Boolean(chatId),
+          hasText: Boolean(text),
+        });
         continue;
       }
 
-      logInfo('record.processing.chat_id_extracted', { messageId: record.messageId, chatId });
-      await sendHelloWorld(chatId);
+      logInfo('record.processing.telegram_payload_ready', { messageId: record.messageId, chatId });
+      await sendTelegramMessage(chatId, text);
       logInfo('record.processing.completed', { messageId: record.messageId, chatId });
     } catch (error) {
       logError('record.processing.failed', error, {
